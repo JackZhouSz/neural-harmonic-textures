@@ -126,16 +126,95 @@ function Get-PyTorchWheelIndexUrl {
     throw "Cannot determine PyTorch CUDA wheel index. Set PYTORCH_CUDA_INDEX or provide a valid CUDA_HOME."
 }
 
+function Get-PinnedTorchVersion {
+    # Parse the pinned torch version from pyproject.toml. Falls back to $null on miss.
+    $pp = Join-Path $PSScriptRoot "pyproject.toml"
+    if (-not (Test-Path $pp)) { return $null }
+    $content = Get-Content $pp -Raw
+    # Match e.g. torch==2.9.1 (allow surrounding quotes / spaces).
+    $m = [regex]::Match($content, 'torch\s*==\s*(\d+\.\d+(?:\.\d+)?)')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return $null
+}
+
+function Get-CurrentPythonTag {
+    # Returns the Python ABI tag (e.g. "cp311") for the currently-active interpreter.
+    try {
+        $tag = python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')" 2>$null
+        if ($tag) { return $tag.Trim() }
+    } catch { }
+    return "cp311" # Matches the venv we just created with `uv venv --python 3.11`.
+}
+
+function Resolve-WindowsCompatibleWheelIndexUrl {
+    # On Windows, the auto-detected CUDA toolkit version may not have torch wheels for
+    # win_amd64 (e.g. cu129 + torch 2.9.1 ships only Linux wheels at the time of this
+    # writing). Probe candidate cu indexes in descending order and pick the first one
+    # that actually publishes a Windows wheel for the pinned torch + active Python.
+    param([string]$Url)
+
+    if (-not $Url) { return $Url }
+    $isWin = ($PSVersionTable.PSVersion.Major -ge 6 -and $IsWindows) -or
+             ($PSVersionTable.PSVersion.Major -lt 6 -and $env:OS -match "Windows")
+    if (-not $isWin) { return $Url }
+
+    $m = [regex]::Match($Url, "/whl/cu(\d+)/?$")
+    if (-not $m.Success) { return $Url }
+    $detectedCu = [int]$m.Groups[1].Value
+
+    $torchVer = Get-PinnedTorchVersion
+    $pyTag    = Get-CurrentPythonTag
+    if (-not $torchVer -or -not $pyTag) { return $Url }
+
+    # Candidate cu versions: detected first, then known Windows-shipped releases.
+    $candidates = @($detectedCu, 128, 126, 124, 121, 118) |
+        Sort-Object -Unique -Descending |
+        Where-Object { $_ -le $detectedCu }
+
+    foreach ($cu in $candidates) {
+        $listUrl = "https://download.pytorch.org/whl/cu$cu/torch/"
+        try {
+            $resp = Invoke-WebRequest -Uri $listUrl -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+        } catch { continue }
+        $needle = "torch-$torchVer+cu$cu-$pyTag-$pyTag-win_amd64.whl"
+        if ($resp.Content -match [regex]::Escape($needle)) {
+            $picked = "https://download.pytorch.org/whl/cu$cu"
+            if ($cu -ne $detectedCu) {
+                Write-Host "  Adjusted PyTorch wheel index for Windows: cu$detectedCu -> cu$cu (no Windows wheel for torch $torchVer on cu$detectedCu yet)." -ForegroundColor Yellow
+            } else {
+                Write-Host "  Verified Windows wheel: torch $torchVer for $pyTag on cu$cu" -ForegroundColor DarkGray
+            }
+            return $picked
+        }
+    }
+
+    Write-Host "  WARNING: No Windows wheel found for torch $torchVer ($pyTag) on cu$detectedCu or any known fallback (cu128/126/124/121/118)." -ForegroundColor Yellow
+    Write-Host "           Proceeding with the auto-detected index; the install will likely fail." -ForegroundColor Yellow
+    Write-Host "           Override manually with `$env:PYTORCH_CUDA_INDEX = 'cuXYZ' and re-run." -ForegroundColor Yellow
+    return $Url
+}
+
 function Ensure-VsBuildEnvironment {
     # Check if cl.exe is truly on the system PATH (not just a PowerShell alias/module).
     # where.exe searches the real PATH that child processes inherit.
     $whereResult = $null
     try { $whereResult = (& where.exe cl.exe 2>&1) | Where-Object { $_ -is [string] -and (Test-Path $_) } | Select-Object -First 1 } catch {}
+    $unsupportedVsPattern = '\\Microsoft Visual Studio\\18\\'
+    $hasUnsupportedVsEnv = (($whereResult -and $whereResult -match $unsupportedVsPattern) -or
+                            ($env:INCLUDE -and $env:INCLUDE -match $unsupportedVsPattern) -or
+                            ($env:LIB -and $env:LIB -match $unsupportedVsPattern) -or
+                            ($env:LIBPATH -and $env:LIBPATH -match $unsupportedVsPattern) -or
+                            ($env:PATH -and $env:PATH -match $unsupportedVsPattern))
     if ($whereResult -and $env:INCLUDE) {
-        Write-Host "  cl.exe already on PATH: $whereResult" -ForegroundColor DarkGray
-        Write-Host "  INCLUDE already set ($($env:INCLUDE.Split(';').Count) entries)" -ForegroundColor DarkGray
-        $env:DISTUTILS_USE_SDK = "1"
-        return
+        if ($hasUnsupportedVsEnv) {
+            Write-Host "  WARNING: A Visual Studio 18 build environment is active, which CUDA 12.x nvcc does not support yet." -ForegroundColor Yellow
+            Write-Host "           Switching to a Visual Studio 2022 toolchain if available." -ForegroundColor Yellow
+        } else {
+            Write-Host "  cl.exe already on PATH: $whereResult" -ForegroundColor DarkGray
+            Write-Host "  INCLUDE already set ($($env:INCLUDE.Split(';').Count) entries)" -ForegroundColor DarkGray
+            $env:DISTUTILS_USE_SDK = "1"
+            return
+        }
     }
 
     Write-Host "  MSVC compiler (cl.exe) not found on system PATH (or INCLUDE not set). Setting up VS build environment..." -ForegroundColor Yellow
@@ -144,7 +223,12 @@ function Ensure-VsBuildEnvironment {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     $vsPath = $null
     if (Test-Path $vswhere) {
-        $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        # CUDA 12.x supports the VS 2022 toolset, but VS 18/Build Tools 2026 can
+        # make cudafe++ crash with ACCESS_VIOLATION during CUDA extension builds.
+        $vsPath = & $vswhere -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        if (-not $vsPath) {
+            $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        }
     }
     if (-not $vsPath) {
         foreach ($root in @("$env:ProgramFiles\Microsoft Visual Studio", "${env:ProgramFiles(x86)}\Microsoft Visual Studio")) {
@@ -160,6 +244,29 @@ function Ensure-VsBuildEnvironment {
         throw "MSVC (cl.exe) is required to build CUDA extensions. See README for details."
     }
     Write-Host "  Found VS at: $vsPath" -ForegroundColor DarkGray
+
+    if ($hasUnsupportedVsEnv) {
+        Write-Host "  Clearing inherited Visual Studio 18 compiler environment..." -ForegroundColor DarkGray
+        $varsToClear = @(
+            "INCLUDE", "LIB", "LIBPATH",
+            "DevEnvDir", "ExtensionSdkDir",
+            "Framework40Version", "FrameworkDir", "FrameworkDir64",
+            "FrameworkVersion", "FrameworkVersion64",
+            "UCRTVersion", "UniversalCRTSdkDir",
+            "VCINSTALLDIR", "VCToolsInstallDir", "VCToolsRedistDir", "VCToolsVersion",
+            "VisualStudioVersion", "VSINSTALLDIR",
+            "VSCMD_ARG_app_plat", "VSCMD_ARG_HOST_ARCH", "VSCMD_ARG_TGT_ARCH", "VSCMD_VER",
+            "WindowsLibPath", "WindowsSdkBinPath", "WindowsSdkDir",
+            "WindowsSDKLibVersion", "WindowsSdkVerBinPath", "WindowsSDKVersion"
+        )
+        foreach ($varName in $varsToClear) {
+            [System.Environment]::SetEnvironmentVariable($varName, $null, 'Process')
+        }
+        if ($env:PATH) {
+            $env:PATH = (($env:PATH -split ';') |
+                Where-Object { $_ -and ($_ -notmatch $unsupportedVsPattern) }) -join ';'
+        }
+    }
 
     # Use vcvarsall.bat to properly set up the full MSVC environment.
     # This is the only reliable way to get PATH, INCLUDE, LIB, and all
@@ -225,15 +332,55 @@ if (-not $uvCmd) {
 }
 
 Write-Host "[1/5] Creating virtual environment (.venv, Python 3.11)..." -ForegroundColor Green
-uv venv --python 3.11 --prompt nht .venv
+# Use a uv-managed (python-build-standalone) interpreter rather than a system
+# / Anaconda Python. Recent PyTorch Windows wheels (>=2.9) are built with
+# MSVC 19.39+ (VS 2022), and loading their c10.dll / torch_cpu.dll against an
+# older CRT (e.g. Anaconda Python's MSC v.1916 from VS 2017) deterministically
+# fails with WinError 1114 ("DLL initialization routine failed") because the
+# C++ static initialisers can't bind to the older runtime. uv's managed
+# interpreters bundle a matching, modern CRT.
+#
+# --python-preference only-managed forces uv to ignore system Python and
+# either reuse a previously-downloaded managed interpreter or download one.
+# --allow-existing makes this idempotent (re-running reuses the venv without
+# the interactive "replace?" prompt). Delete .venv to force a clean rebuild.
+uv python install 3.11
+
+# If a previous run created .venv with a non-managed (Anaconda / system) Python,
+# rebuild it from scratch. The interpreter path encodes the source, so we can
+# detect this by checking pyvenv.cfg's "home" line.
+$venvCfg = Join-Path $PSScriptRoot ".venv\pyvenv.cfg"
+if (Test-Path $venvCfg) {
+    $homeLine = (Get-Content $venvCfg | Where-Object { $_ -match "^home\s*=" } | Select-Object -First 1)
+    $isManaged = $homeLine -and ($homeLine -match "uv[\\/]python|python-build-standalone")
+    if (-not $isManaged) {
+        Write-Host "  Existing .venv was built from a non-managed Python ($homeLine). Recreating with uv-managed Python to avoid CRT mismatches." -ForegroundColor Yellow
+        Remove-Item -Recurse -Force (Join-Path $PSScriptRoot ".venv")
+    }
+}
+uv venv --python 3.11 --python-preference only-managed --prompt nht --allow-existing .venv
 & .\.venv\Scripts\Activate.ps1
+$pyVerLine = python -c "import sys; print(sys.version)" 2>&1 | Select-Object -First 1
+Write-Host "  venv python: $pyVerLine" -ForegroundColor DarkGray
 
 # Ensure the MSVC build environment is available AFTER venv activation.
 # Activate.ps1 restores _OLD_VIRTUAL_PATH which would undo any PATH changes made before it.
 Ensure-VsBuildEnvironment
 
 Write-Host "[2/5] Initializing gsplat submodule..." -ForegroundColor Green
-git submodule update --init --recursive --remote
+# NHT builds against the gsplat fork at https://github.com/Arcanous98/gsplat
+$gsplatUrl = (git config -f .gitmodules --get submodule.gsplat.url)
+$gsplatBranch = (git config -f .gitmodules --get submodule.gsplat.branch)
+if (-not $gsplatBranch) { $gsplatBranch = "HEAD" }
+Write-Host "  gsplat source: $gsplatUrl (branch $gsplatBranch)" -ForegroundColor DarkGray
+git submodule sync --recursive
+
+# Initialize / check out the SHA pinned in the parent repo's index. Do NOT use
+# --remote: that would silently fast-forward (or detach) the submodule to
+# whatever the configured branch in .gitmodules currently points to on the fork,
+# which can clobber local rebase work. The parent repo is the source of truth
+# for which gsplat commit goes with which NHT commit.
+git submodule update --init --recursive
 
 Write-Host "[3a/5] CUDA + PyTorch (CUDA wheels)..." -ForegroundColor Green
 $cudaOk = Set-CudaHomeFromToolkit
@@ -246,41 +393,71 @@ if (-not $cudaOk) {
 Write-Host "  Found CUDA toolkit at $env:CUDA_HOME" -ForegroundColor DarkGray
 
 $wheelUrl = Get-PyTorchWheelIndexUrl
+$wheelUrl = Resolve-WindowsCompatibleWheelIndexUrl -Url $wheelUrl
 Write-Host "  PyTorch wheel index: $wheelUrl" -ForegroundColor DarkGray
 $env:UV_INDEX="pytorch=$wheelUrl"
 
 Write-Host "[3b/5] Installing pytorch and 'nht' package (AOV helpers)..." -ForegroundColor Green
 uv pip install -e .
 
-# Setup TORCH_CUDA_ARCH_LIST and TCNN_CUDA_ARCHITECTURES properly based on the installed PyTorch's supported CUDA architectures, with a 
-# minimum of 7.0 (Ampere) to avoid long compile times for older unsupported architectures. Having a minimum capability is to avoid the 
-# following compilation issue:
+# Setup TORCH_CUDA_ARCH_LIST and TCNN_CUDA_ARCHITECTURES from the locally-installed
+# GPU(s) only. Building for every arch torch's wheel supports (sm_70..sm_120) is
+# wasteful for an editable / single-machine install and, on Windows + CUDA 12.9,
+# fatal: sm_100 / sm_120 pull in cluster-launch headers that hit the known
+# `asm operand type size(4) does not match constraint 'l'` bug in
+# `cuda/__ptx/instructions/generated/clusterlaunchcontrol.h` (long is 32-bit on
+# Windows but the asm constraint expects 64-bit). PTX is appended so the build
+# still runs on a slightly newer GPU if the binary is later moved.
 #
-# error: namespace "cooperative_groups" has no member "labeled_partition"
-# DEBUG       auto warp_group_g = cg::labeled_partition(warp, gid);
-# DEBUG                               ^
-# DEBUG  
+# A minimum of compute 7.0 (Volta) avoids:
+#   error: namespace "cooperative_groups" has no member "labeled_partition"
+# on the cg::labeled_partition path. See
+# https://github.com/nerfstudio-project/gsplat/issues/653.
 #
-# See: https://forums.developer.nvidia.com/t/cuda-11-4-cooperative-groups-no-longer-supported-on-sm-7-0/194001
-# See: https://github.com/nerfstudio-project/gsplat/issues/653
-#
-# Add PTX to TORCH_CUDA_ARCH_LIST to allow JIT compilation for newer architectures not in the list. Tiny-CUDA-NN always generate PTX for 
-# each specified architecture, so we don't need to add +PTX to TCNN_CUDA_ARCHITECTURES.
+# Override $env:TORCH_CUDA_ARCH_LIST / $env:TCNN_CUDA_ARCHITECTURES before running
+# this script to force a wider build matrix (e.g. for CI that targets multiple
+# GPUs).
 $minCudaArch = 70
 
-$torchCudaArchList = uv run python -c "import torch,re; min_arch = $minCudaArch; archs = set(); [archs.add(m.group(1)+'.'+m.group(2)+m.group(3)) for s in torch.cuda.get_arch_list() for m in [re.match(r'sm_(\d+)(\d)([a-z]?)$', s)] if m and int(m.group(1)+m.group(2)) >= min_arch]; [archs.add(f'{cc//10}.{cc%10}') for i in range(torch.cuda.device_count()) if (cc:=torch.cuda.get_device_capability(i)[0]*10+torch.cuda.get_device_capability(i)[1]) >= min_arch]; print(';'.join(sorted(archs)))"
-if (-not $torchCudaArchList) {
-    Write-Host "  WARNING: No CUDA architecture list found for torch. Using default: 9.0" -ForegroundColor Yellow
-    $torchCudaArchList = "9.0"
-}
-$env:TORCH_CUDA_ARCH_LIST = $torchCudaArchList + "+PTX"
+$archDetectScript = @"
+import torch
+min_arch = $minCudaArch
+caps = set()
+for i in range(torch.cuda.device_count()):
+    maj, minr = torch.cuda.get_device_capability(i)
+    cc = maj * 10 + minr
+    if cc >= min_arch:
+        caps.add((maj, minr))
+print(';'.join(f'{m}.{n}' for m, n in sorted(caps)))
+"@
 
-$tcnnCudaArchList = uv run python -c "import torch,re; min_arch = $minCudaArch; archs = set(); [archs.add(m.group(1)+m.group(2)+m.group(3)) for s in torch.cuda.get_arch_list() for m in [re.match(r'sm_(\d+)(\d)([a-z]?)$', s)] if m and int(m.group(1)+m.group(2)) >= min_arch]; [archs.add(str(cc)) for i in range(torch.cuda.device_count()) if (cc:=torch.cuda.get_device_capability(i)[0]*10+torch.cuda.get_device_capability(i)[1]) >= min_arch]; print(';'.join(sorted(archs)))"
-if (-not $tcnnCudaArchList) {
-    Write-Host "  WARNING: No CUDA architecture list found for tcnn. Using default: 90" -ForegroundColor Yellow
-    $tcnnCudaArchList = "90"
+# Allow CI / power users to override via a dedicated env var. The script always
+# recomputes TORCH_CUDA_ARCH_LIST / TCNN_CUDA_ARCHITECTURES on every invocation,
+# so stale wide values left over from earlier runs in the same shell don't keep
+# blowing up the build.
+if ($env:NHT_TORCH_CUDA_ARCH_LIST) {
+    $env:TORCH_CUDA_ARCH_LIST = $env:NHT_TORCH_CUDA_ARCH_LIST
+    Write-Host "  TORCH_CUDA_ARCH_LIST: $($env:TORCH_CUDA_ARCH_LIST) (from NHT_TORCH_CUDA_ARCH_LIST)" -ForegroundColor DarkGray
+} else {
+    $localArchs = uv run python -c $archDetectScript
+    if ($localArchs) {
+        $env:TORCH_CUDA_ARCH_LIST = $localArchs + "+PTX"
+    } else {
+        Write-Host "  WARNING: No CUDA-capable GPU detected. Defaulting to TORCH_CUDA_ARCH_LIST=8.9+PTX (RTX 40-series)." -ForegroundColor Yellow
+        Write-Host "           Override with `$env:NHT_TORCH_CUDA_ARCH_LIST='X.Y;...' if your target differs." -ForegroundColor Yellow
+        $env:TORCH_CUDA_ARCH_LIST = "8.9+PTX"
+    }
+    Write-Host "  TORCH_CUDA_ARCH_LIST: $($env:TORCH_CUDA_ARCH_LIST)" -ForegroundColor DarkGray
 }
-$env:TCNN_CUDA_ARCHITECTURES = $tcnnCudaArchList
+
+# tiny-cuda-nn expects integer-encoded archs (e.g. "89" for sm_89) and always
+# emits PTX, so no +PTX suffix here. We also strip any alphabetic arch suffix
+# (e.g. "9.0a" -> "90") because tcnn's setup.py runs int() on each entry and
+# crashes on Hopper-variant tokens like "90a". gsplat itself still builds for
+# the full TORCH_CUDA_ARCH_LIST above (which keeps "9.0a").
+$tcnnArchs = ($env:TORCH_CUDA_ARCH_LIST -replace '\+PTX$','').Split(';') |
+    ForEach-Object { (($_ -replace '\.','') -replace '[a-zA-Z]','') }
+$env:TCNN_CUDA_ARCHITECTURES = ($tcnnArchs -join ';')
 Write-Host "  TCNN_CUDA_ARCHITECTURES: $($env:TCNN_CUDA_ARCHITECTURES)" -ForegroundColor DarkGray
 
 # Verify cl.exe is visible to child processes before compiling
@@ -294,8 +471,20 @@ if ($clCheck) {
 }
 
 # Install dependencies
-Write-Host "[4/5] Installing gsplat..." -ForegroundColor Green
-uv pip install --no-build-isolation -e ./gsplat
+Write-Host "[4/5] Installing gsplat (with [nht] extra: tinycudann)..." -ForegroundColor Green
+# Defensive: --no-build-isolation reuses the active venv's interpreter for the build
+# backend, so setuptools / wheel / ninja must already be installed there. They are
+# listed in the nht pyproject.toml above, but ensure them here so a partial step [3b]
+# doesn't cascade into opaque "ModuleNotFoundError: setuptools" build failures.
+uv pip install setuptools wheel ninja
+
+# The [nht] extra pulls tinycudann from git, which recursively initialises
+# cutlass. Cutlass's docs tree contains paths longer than Windows' default
+# MAX_PATH (260), so without core.longpaths git fails the submodule checkout
+# with "Filename too long" and pip aborts metadata generation. We enable it
+# globally for the current user before any tcnn-related git submodule init.
+git config --global core.longpaths true
+uv pip install --no-build-isolation -e "./gsplat[nht]"
 
 Write-Host "[5/5] Installing example dependencies..." -ForegroundColor Green
 $examplesReq = Join-Path $PSScriptRoot "gsplat\examples\requirements.txt"

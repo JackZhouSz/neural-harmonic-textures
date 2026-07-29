@@ -1,4 +1,4 @@
 [submodule "gsplat"]
 	path = gsplat
-	url = https://github.com/nerfstudio-project/gsplat.git
-	branch = nv/nht-initial-release
+	url = https://github.com/Arcanous98/gsplat.git
+	branch = main
